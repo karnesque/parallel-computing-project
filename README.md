@@ -1,4 +1,4 @@
-# CUDA Humidity Trend Analysis
+# Humidity Analysis for Drought Risk Cities
 
 ## How to Run Programs
 

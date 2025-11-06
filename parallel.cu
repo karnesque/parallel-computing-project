@@ -8,355 +8,367 @@
 #include <thrust/device_vector.h>
 #include <thrust/reduce.h>
 #include <thrust/extrema.h>
-#include <thrust/scan.h>
+#include <thrust/transform_reduce.h>
+#include <thrust/sort.h>
 
+#define MAX_CITIES 50
+#define MAX_CITY_NAME_LENGTH 50
+#define MAX_LINE_LENGTH 2048
+
+// City drought risk data
 typedef struct {
-    int year;
-    int month;
-    float humidity;
-} HumidityRecord;
+    char city_name[MAX_CITY_NAME_LENGTH];
+    double dri_value;
+    double avg_humidity;
+    double trend_slope;
+    long dry_days;
+    long total_records;
+    int data_column;
+} CityDroughtRisk;
 
-typedef struct {
-    float mean_humidity;
-    float min_humidity;
-    float max_humidity;
-    float humidity_trend;
-    long record_count;
-    int best_year;
-    int worst_year;
-    float humidity_variance;
-} HumidityStats;
+// GPU kernels for parallel computation
+__global__ void calculateBasicStats(float* humidity_data, int* record_counts,
+                                   double* avg_humidity, long* dry_days,
+                                   int num_cities, int total_records) {
+    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-// CUDA kernel to extract humidity data
-__global__ void extractHumidityKernel(const HumidityRecord* records, float* humidity,
-                                     int* years, long count) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < count) {
-        humidity[idx] = records[idx].humidity;
-        years[idx] = records[idx].year;
+    if (city_idx < num_cities && record_counts[city_idx] > 0) {
+        double sum = 0.0;
+        long dry_count = 0;
+
+        for (int i = 0; i < record_counts[city_idx]; i++) {
+            float humidity = humidity_data[city_idx * total_records + i];
+            sum += humidity;
+            if (humidity < 30.0f) {
+                dry_count++;
+            }
+        }
+
+        avg_humidity[city_idx] = sum / record_counts[city_idx];
+        dry_days[city_idx] = dry_count;
     }
 }
 
-HumidityRecord* readHumidityCSV(const char* filename, long* count) {
-    FILE* file = fopen(filename, "r");
-    if (!file) {
-        printf("Error: Cannot open %s\n", filename);
-        return NULL;
-    }
+__global__ void calculateTrends(float* humidity_data, int* record_counts,
+                               double* trend_slopes, int num_cities, int total_records) {
+    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-    char line[1024];
-    long lines = 0;
-    while (fgets(line, sizeof(line), file)) lines++;
-    rewind(file);
+    if (city_idx < num_cities && record_counts[city_idx] > 100) {
+        int half_count = record_counts[city_idx] / 2;
+        double first_half_sum = 0.0, second_half_sum = 0.0;
 
-    // Skip header line
-    if (fgets(line, sizeof(line), file) == NULL) {
-        printf("Error: Empty file or header read failed\n");
-        fclose(file);
-        return NULL;
-    }
-    lines--;
-
-    if (lines <= 0) {
-        printf("Error: No data records found in file\n");
-        fclose(file);
-        return NULL;
-    }
-
-    HumidityRecord* records = malloc(lines * sizeof(HumidityRecord));
-    if (!records) {
-        printf("Error: Memory allocation failed for %ld records\n", lines);
-        fclose(file);
-        return NULL;
-    }
-
-    long count_read = 0;
-    long line_number = 2; // Start after header
-
-    while (fgets(line, sizeof(line), file) && count_read < lines) {
-        HumidityRecord r;
-        if (sscanf(line, "%d,%d,%f", &r.year, &r.month, &r.humidity) == 3) {
-            // Basic validation
-            if (r.year < 1900 || r.year > 2100 || r.month < 1 || r.month > 12) {
-                printf("Warning: Invalid date %d/%d at line %ld, skipping\n", r.year, r.month, line_number);
-                line_number++;
-                continue;
-            }
-            records[count_read++] = r;
-        } else {
-            printf("Warning: Malformed line %ld, skipping: %s", line_number, line);
+        for (int i = 0; i < half_count; i++) {
+            first_half_sum += humidity_data[city_idx * total_records + i];
         }
-        line_number++;
+
+        for (int i = half_count; i < record_counts[city_idx]; i++) {
+            second_half_sum += humidity_data[city_idx * total_records + i];
+        }
+
+        double first_avg = first_half_sum / half_count;
+        double second_avg = second_half_sum / (record_counts[city_idx] - half_count);
+
+        trend_slopes[city_idx] = (second_avg - first_avg) / half_count * 100.0;
+    } else {
+        trend_slopes[city_idx] = 0.0;
+    }
+}
+
+__global__ void calculateVolatility(float* humidity_data, int* record_counts,
+                                   double* volatility, int num_cities, int total_records) {
+    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (city_idx < num_cities && record_counts[city_idx] > 1) {
+        double total_change = 0.0;
+
+        for (int i = 1; i < record_counts[city_idx]; i++) {
+            float curr = humidity_data[city_idx * total_records + i];
+            float prev = humidity_data[city_idx * total_records + i - 1];
+            total_change += fabs(curr - prev);
+        }
+
+        volatility[city_idx] = total_change / (record_counts[city_idx] - 1);
+    } else {
+        volatility[city_idx] = 0.0;
+    }
+}
+
+__global__ void calculateDRI(double* avg_humidity, long* dry_days, int* record_counts,
+                            double* trend_slopes, double* volatility, double* dri_values,
+                            int num_cities) {
+    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (city_idx < num_cities && record_counts[city_idx] > 0) {
+        // HFI - Humidity Frequency Index
+        double HFI = (double)dry_days[city_idx] / record_counts[city_idx];
+
+        // HSI - Humidity Severity Index
+        double avg_ratio = avg_humidity[city_idx] / 100.0;
+        double HSI = (1.0 - avg_ratio) * 0.6;
+
+        // HTI - Humidity Trend Index
+        double HTI = (trend_slopes[city_idx] < 0) ? (-trend_slopes[city_idx] / 2.0) : 0.0;
+        if (HTI > 1.0) HTI = 1.0;
+
+        // HVI - Humidity Volatility Index
+        double HVI = volatility[city_idx] / 100.0;
+        if (HVI > 1.0) HVI = 1.0;
+
+        // Calculate final DRI
+        dri_values[city_idx] = 0.35 * HFI + 0.30 * HSI + 0.20 * HTI + 0.15 * HVI;
+        if (dri_values[city_idx] > 1.0) dri_values[city_idx] = 1.0;
+    }
+}
+
+// Comparison function for sorting
+int compareDRI(const void* a, const void* b) {
+    CityDroughtRisk* cityA = (CityDroughtRisk*)a;
+    CityDroughtRisk* cityB = (CityDroughtRisk*)b;
+    if (cityB->dri_value > cityA->dri_value) return 1;
+    if (cityB->dri_value < cityA->dri_value) return -1;
+    return 0;
+}
+
+// Global variables
+CityDroughtRisk cities[MAX_CITIES];
+int num_cities = 0;
+int total_records = 0;
+
+// Parse city names from header line
+int parseCityHeaders(const char* header_line) {
+    char* token;
+    char line_copy[MAX_LINE_LENGTH];
+    int column = 0;
+
+    strcpy(line_copy, header_line);
+
+    // Skip datetime column
+    token = strtok(line_copy, ",");
+    column++;
+
+    // Parse city names
+    while ((token = strtok(NULL, ",")) != NULL && num_cities < MAX_CITIES) {
+        if (strlen(token) > 0) {
+            strcpy(cities[num_cities].city_name, token);
+            cities[num_cities].data_column = column;
+            cities[num_cities].dri_value = 0.0;
+            cities[num_cities].avg_humidity = 0.0;
+            cities[num_cities].trend_slope = 0.0;
+            cities[num_cities].dry_days = 0;
+            cities[num_cities].total_records = 0;
+            num_cities++;
+        }
+        column++;
+    }
+
+    return num_cities;
+}
+
+// Load multi-city data from CSV
+void loadMultiCityData(const char* filepath) {
+    FILE* file = fopen(filepath, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Cannot open file %s\n", filepath);
+        return;
+    }
+
+    char line[MAX_LINE_LENGTH];
+
+    // Read header line
+    if (fgets(line, sizeof(line), file)) {
+        parseCityHeaders(line);
     }
 
     fclose(file);
-
-    if (count_read == 0) {
-        printf("Error: No valid records found in file\n");
-        free(records);
-        return NULL;
-    }
-
-    *count = count_read;
-    printf("Loaded %ld humidity records (out of %ld lines processed)\n", count_read, lines);
-    return records;
 }
 
-HumidityStats analyzeParallel(HumidityRecord* records, long count) {
-    HumidityStats stats = {0};
-    stats.record_count = count;
+// Process all data with GPU acceleration
+void processAllDataGPU(const char* filepath) {
+    FILE* file = fopen(filepath, "r");
+    if (!file) return;
 
-    if (count == 0) return stats;
+    char line[MAX_LINE_LENGTH];
 
-    clock_t start = clock();
+    // Skip header
+    fgets(line, sizeof(line), file);
 
-    // Allocate device memory with error checking
-    HumidityRecord* d_records = NULL;
-    float* d_humidity = NULL;
-    int* d_years = NULL;
+    // Allocate memory for humidity data
+    float** humidity_data = (float**)malloc((num_cities + 5) * sizeof(float*));
+    for (int i = 0; i < num_cities + 5; i++) {
+        humidity_data[i] = (float*)malloc(100000 * sizeof(float));
+    }
 
+    int record_count = 0;
+
+    // Read data line by line
+    while (fgets(line, sizeof(line), file) && record_count < 100000) {
+        char* token = strtok(line, ",");
+        int column = 0;
+
+        // Skip datetime column
+        column++;
+
+        while ((token = strtok(NULL, ",")) != NULL && column < num_cities + 5) {
+            float humidity = atof(token);
+            if (humidity > 0.0f && humidity <= 100.0f) {
+                humidity_data[column][record_count] = humidity;
+                if (column - 1 < num_cities) {
+                    cities[column - 1].total_records++;
+                }
+            }
+            column++;
+        }
+        record_count++;
+    }
+
+    total_records = record_count;
+    fclose(file);
+
+    // Prepare data for GPU
+    int* device_record_counts;
+    double* device_avg_humidity;
+    long* device_dry_days;
+    double* device_trend_slopes;
+    double* device_volatility;
+    double* device_dri_values;
+    float* device_humidity_data;
+
+    // Allocate device memory
     cudaError_t err;
-    err = cudaMalloc(&d_records, count * sizeof(HumidityRecord));
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Failed to allocate device memory for records: %s\n", cudaGetErrorString(err));
-        return stats;
+    err = cudaMalloc(&device_record_counts, num_cities * sizeof(int));
+    if (err != cudaSuccess) printf("CUDA Error 1: %s\n", cudaGetErrorString(err));
+
+    err = cudaMalloc(&device_avg_humidity, num_cities * sizeof(double));
+    if (err != cudaSuccess) printf("CUDA Error 2: %s\n", cudaGetErrorString(err));
+
+    err = cudaMalloc(&device_dry_days, num_cities * sizeof(long));
+    if (err != cudaSuccess) printf("CUDA Error 3: %s\n", cudaGetErrorString(err));
+
+    err = cudaMalloc(&device_trend_slopes, num_cities * sizeof(double));
+    if (err != cudaSuccess) printf("CUDA Error 4: %s\n", cudaGetErrorString(err));
+
+    err = cudaMalloc(&device_volatility, num_cities * sizeof(double));
+    if (err != cudaSuccess) printf("CUDA Error 5: %s\n", cudaGetErrorString(err));
+
+    err = cudaMalloc(&device_dri_values, num_cities * sizeof(double));
+    if (err != cudaSuccess) printf("CUDA Error 6: %s\n", cudaGetErrorString(err));
+
+    err = cudaMalloc(&device_humidity_data, num_cities * total_records * sizeof(float));
+    if (err != cudaSuccess) printf("CUDA Error 7: %s\n", cudaGetErrorString(err));
+
+    // Copy record counts to device
+    int* host_record_counts = (int*)malloc(num_cities * sizeof(int));
+    for (int i = 0; i < num_cities; i++) {
+        host_record_counts[i] = cities[i].total_records;
     }
+    cudaMemcpy(device_record_counts, host_record_counts, num_cities * sizeof(int), cudaMemcpyHostToDevice);
 
-    err = cudaMalloc(&d_humidity, count * sizeof(float));
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Failed to allocate device memory for humidity: %s\n", cudaGetErrorString(err));
-        cudaFree(d_records);
-        return stats;
-    }
-
-    err = cudaMalloc(&d_years, count * sizeof(int));
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Failed to allocate device memory for years: %s\n", cudaGetErrorString(err));
-        cudaFree(d_records);
-        cudaFree(d_humidity);
-        return stats;
-    }
-
-    // Copy to device with error checking
-    err = cudaMemcpy(d_records, records, count * sizeof(HumidityRecord), cudaMemcpyHostToDevice);
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Failed to copy data to device: %s\n", cudaGetErrorString(err));
-        cudaFree(d_records);
-        cudaFree(d_humidity);
-        cudaFree(d_years);
-        return stats;
-    }
-
-    // Setup kernel
-    int blockSize = 256;
-    int gridSize = (count + blockSize - 1) / blockSize;
-
-    // Launch kernel to extract data with error checking
-    extractHumidityKernel<<<gridSize, blockSize>>>(d_records, d_humidity, d_years, count);
-    err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Kernel launch failed: %s\n", cudaGetErrorString(err));
-        cudaFree(d_records);
-        cudaFree(d_humidity);
-        cudaFree(d_years);
-        return stats;
-    }
-
-    err = cudaDeviceSynchronize();
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Kernel synchronization failed: %s\n", cudaGetErrorString(err));
-        cudaFree(d_records);
-        cudaFree(d_humidity);
-        cudaFree(d_years);
-        return stats;
-    }
-
-    // Use Thrust for parallel operations
-    thrust::device_ptr<float> d_humidity_ptr(d_humidity);
-    thrust::device_ptr<int> d_years_ptr(d_years);
-
-    // THRUST REDUCE: Parallel sum reduction
-    float humidity_sum = thrust::reduce(d_humidity_ptr, d_humidity_ptr + count, 0.0f);
-
-    // THRUST EXTREMA: Find min/max
-    float min_humidity = *thrust::min_element(d_humidity_ptr, d_humidity_ptr + count);
-    float max_humidity = *thrust::max_element(d_humidity_ptr, d_humidity_ptr + count);
-
-    // Calculate mean
-    stats.mean_humidity = humidity_sum / count;
-    stats.min_humidity = min_humidity;
-    stats.max_humidity = max_humidity;
-
-    // Copy back data for trend analysis with error checking
-    float* h_humidity = (float*)malloc(count * sizeof(float));
-    int* h_years = (int*)malloc(count * sizeof(int));
-
-    if (!h_humidity || !h_years) {
-        printf("Error: Failed to allocate host memory for trend analysis\n");
-        cudaFree(d_records);
-        cudaFree(d_humidity);
-        cudaFree(d_years);
-        if (h_humidity) free(h_humidity);
-        if (h_years) free(h_years);
-        return stats;
-    }
-
-    err = cudaMemcpy(h_humidity, d_humidity, count * sizeof(float), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Failed to copy humidity data back to host: %s\n", cudaGetErrorString(err));
-        cudaFree(d_records);
-        cudaFree(d_humidity);
-        cudaFree(d_years);
-        free(h_humidity);
-        free(h_years);
-        return stats;
-    }
-
-    err = cudaMemcpy(h_years, d_years, count * sizeof(int), cudaMemcpyDeviceToHost);
-    if (err != cudaSuccess) {
-        printf("CUDA Error: Failed to copy years data back to host: %s\n", cudaGetErrorString(err));
-        cudaFree(d_records);
-        cudaFree(d_humidity);
-        cudaFree(d_years);
-        free(h_humidity);
-        free(h_years);
-        return stats;
-    }
-
-    // Calculate trend (CPU - complex logic) - Fixed division by zero
-    float sum_xy = 0, sum_x = 0, sum_y = 0, sum_x2 = 0;
-    int min_year = h_years[0], max_year = h_years[0];  // Use device data, not original records
-
-    for (long i = 0; i < count; i++) {
-        sum_x += h_years[i];
-        sum_y += h_humidity[i];
-        sum_xy += h_years[i] * h_humidity[i];
-        sum_x2 += h_years[i] * h_years[i];
-
-        if (h_years[i] < min_year) min_year = h_years[i];
-        if (h_years[i] > max_year) max_year = h_years[i];
-    }
-
-    long n = count;
-    float denominator = (n * sum_x2 - sum_x * sum_x);
-    float slope = 0.0f;
-    if (fabsf(denominator) > 1e-10f) {  // Avoid division by zero
-        slope = (n * sum_xy - sum_x * sum_y) / denominator;
-    }
-    stats.humidity_trend = slope;
-
-    // THRUST TRANSFORM-REDUCE: Parallel variance calculation
-    float variance_sum = thrust::transform_reduce(
-        d_humidity_ptr, d_humidity_ptr + count,
-        [mean_humidity = stats.mean_humidity] __device__ (float humidity) {
-            float diff = humidity - mean_humidity;
-            return diff * diff;
-        },
-        0.0f,
-        thrust::plus<float>()
-    );
-    stats.humidity_variance = sqrtf(variance_sum / count);
-
-    // Find best/worst years
-    float* yearly_humidities = calloc(max_year - min_year + 1, sizeof(float));
-    int* yearly_counts = calloc(max_year - min_year + 1, sizeof(int));
-
-    for (long i = 0; i < count; i++) {
-        int idx = h_years[i] - min_year;
-        yearly_humidities[idx] += h_humidity[i];
-        yearly_counts[idx]++;
-    }
-
-    float max_avg = -999, min_avg = 999;
-    for (int year = min_year; year <= max_year; year++) {
-        int idx = year - min_year;
-        if (yearly_counts[idx] > 0) {
-            float avg = yearly_humidities[idx] / yearly_counts[idx];
-            if (avg > max_avg) {
-                max_avg = avg;
-                stats.best_year = year;
-            }
-            if (avg < min_avg) {
-                min_avg = avg;
-                stats.worst_year = year;
-            }
+    // Copy humidity data to device (flatten 2D array)
+    float* flattened_data = (float*)malloc(num_cities * total_records * sizeof(float));
+    for (int city = 0; city < num_cities; city++) {
+        for (int record = 0; record < cities[city].total_records; record++) {
+            flattened_data[city * total_records + record] = humidity_data[city][record];
         }
     }
+    cudaMemcpy(device_humidity_data, flattened_data, num_cities * total_records * sizeof(float), cudaMemcpyHostToDevice);
 
-    // Cleanup
-    cudaFree(d_records);
-    cudaFree(d_humidity);
-    cudaFree(d_years);
-    free(h_humidity);
-    free(h_years);
-    free(yearly_humidities);
-    free(yearly_counts);
+    // Configure kernel launch parameters
+    int threads_per_block = 256;
+    int blocks_per_grid = (num_cities + threads_per_block - 1) / threads_per_block;
 
-    clock_t end = clock();
-    double elapsed = ((double)(end - start)) / CLOCKS_PER_SEC;
-    printf("CUDA processing time: %.3f seconds\n", elapsed);
+    // Launch kernels
+    calculateBasicStats<<<blocks_per_grid, threads_per_block>>>(
+        device_humidity_data, device_record_counts, device_avg_humidity,
+        device_dry_days, num_cities, total_records);
 
-    return stats;
-}
+    calculateTrends<<<blocks_per_grid, threads_per_block>>>(
+        device_humidity_data, device_record_counts, device_trend_slopes,
+        num_cities, total_records);
 
-void printResults(HumidityStats stats, double elapsed) {
-    printf("\n=== CUDA PARALLEL RESULTS ===\n");
-    printf("Records processed: %ld\n", stats.record_count);
-    printf("Processing time: %.3f seconds\n", elapsed);
-    printf("Performance: %.0f records/second\n", stats.record_count / elapsed);
-    printf("\n📊 HUMIDITY ANALYSIS RESULTS:\n");
-    printf("• Mean Humidity: %.1f%%\n", stats.mean_humidity);
-    printf("• Humidity Range: %.1f%% to %.1f%%\n", stats.min_humidity, stats.max_humidity);
-    printf("• Humidity Volatility: %.1f%% (std dev)\n", stats.humidity_variance);
+    calculateVolatility<<<blocks_per_grid, threads_per_block>>>(
+        device_humidity_data, device_record_counts, device_volatility,
+        num_cities, total_records);
 
-    if (stats.humidity_trend > 0) {
-        printf("• 📈 Humidity Trend: +%.3f%% per year (INCREASING)\n", stats.humidity_trend);
-    } else if (stats.humidity_trend < 0) {
-        printf("• 📉 Humidity Trend: %.3f%% per year (DECREASING)\n", stats.humidity_trend);
-    } else {
-        printf("• 📊 Humidity Trend: Stable\n");
+    calculateDRI<<<blocks_per_grid, threads_per_block>>>(
+        device_avg_humidity, device_dry_days, device_record_counts,
+        device_trend_slopes, device_volatility, device_dri_values, num_cities);
+
+    cudaDeviceSynchronize();
+
+    // Copy results back to host
+    double* host_avg_humidity = (double*)malloc(num_cities * sizeof(double));
+    long* host_dry_days = (long*)malloc(num_cities * sizeof(long));
+    double* host_trend_slopes = (double*)malloc(num_cities * sizeof(double));
+    double* host_volatility = (double*)malloc(num_cities * sizeof(double));
+    double* host_dri_values = (double*)malloc(num_cities * sizeof(double));
+
+    cudaMemcpy(host_avg_humidity, device_avg_humidity, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_dry_days, device_dry_days, num_cities * sizeof(long), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_trend_slopes, device_trend_slopes, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_volatility, device_volatility, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
+    cudaMemcpy(host_dri_values, device_dri_values, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
+
+    // Update cities data
+    for (int i = 0; i < num_cities; i++) {
+        cities[i].avg_humidity = host_avg_humidity[i];
+        cities[i].dry_days = host_dry_days[i];
+        cities[i].trend_slope = host_trend_slopes[i];
+        cities[i].dri_value = host_dri_values[i];
     }
 
-    printf("• Best Year: %d\n", stats.best_year);
-    printf("• Worst Year: %d\n", stats.worst_year);
+    // Sort cities by DRI using CPU
+    qsort(cities, num_cities, sizeof(CityDroughtRisk), compareDRI);
 
-    printf("\n🎯 HUMIDITY Comfort Assessment:\n");
-    if (stats.mean_humidity > 70 && stats.mean_humidity < 80) {
-        printf("• Status: COMFORTABLE humidity levels\n");
-        printf("• Recommendation: Maintain current conditions\n");
-    } else if (stats.mean_humidity >= 60 && stats.mean_humidity <= 85) {
-        printf("• Status: ACCEPTABLE humidity levels\n");
-        printf("• Recommendation: Minor adjustments suggested\n");
-    } else {
-        printf("• Status: UNCOMFORTABLE humidity levels\n");
-        printf("• Recommendation: Significant adjustments needed\n");
+    // Free memory
+    cudaFree(device_record_counts);
+    cudaFree(device_avg_humidity);
+    cudaFree(device_dry_days);
+    cudaFree(device_trend_slopes);
+    cudaFree(device_volatility);
+    cudaFree(device_dri_values);
+    cudaFree(device_humidity_data);
+
+    for (int i = 0; i < num_cities + 5; i++) {
+        free(humidity_data[i]);
     }
-
-    printf("=================================\n\n");
+    free(humidity_data);
+    free(host_record_counts);
+    free(flattened_data);
+    free(host_avg_humidity);
+    free(host_dry_days);
+    free(host_trend_slopes);
+    free(host_volatility);
+    free(host_dri_values);
 }
 
+// Print top 3 cities with highest drought risk
+void printTop3Cities(double process_time) {
+    printf("Dataset: %d records\n", total_records);
+    printf("Top 3 Drought Risk Cities:\n");
+
+    for (int i = 0; i < 3 && i < num_cities; i++) {
+        printf("%d. %s (DRI: %.3f)\n", i + 1, cities[i].city_name, cities[i].dri_value);
+    }
+
+    printf("Time: %.3f seconds\n", process_time);
+}
+
+// Main program
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <humidity_data.csv>\n", argv[0]);
-        return 1;
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <humidity_data.csv>\n", argv[0]);
+        return EXIT_FAILURE;
     }
 
-    printf("CUDA Parallel Humidity Analysis - THRUST SCAN/REDUCE\n");
-    printf("===================================================\n");
+    clock_t start_time = clock();
 
-    clock_t total_start = clock();
+    loadMultiCityData(argv[1]);
+    processAllDataGPU(argv[1]);
 
-    long count;
-    HumidityRecord* records = readHumidityCSV(argv[1], &count);
-    if (!records) return 1;
+    clock_t end_time = clock();
+    double process_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
 
-    HumidityStats stats = analyzeParallel(records, count);
+    printTop3Cities(process_time);
 
-    clock_t total_end = clock();
-    double total_elapsed = ((double)(total_end - total_start)) / CLOCKS_PER_SEC;
-
-    printResults(stats, total_elapsed);
-
-    free(records);
-    return 0;
+    return EXIT_SUCCESS;
 }

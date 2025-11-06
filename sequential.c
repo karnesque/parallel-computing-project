@@ -5,285 +5,245 @@
 #include <time.h>
 #include <stdbool.h>
 
+#define MAX_CITIES 50
+#define MAX_CITY_NAME_LENGTH 50
+#define MAX_LINE_LENGTH 2048
+
+// City drought risk data
 typedef struct {
-    int year;
-    int month;
-    float humidity;
-} HumidityRecord;
+    char city_name[MAX_CITY_NAME_LENGTH];
+    double dri_value;
+    double avg_humidity;
+    double trend_slope;
+    long dry_days;
+    long total_records;
+    int data_column;
+} CityDroughtRisk;
 
-typedef struct {
-    float mean_humidity;
-    float min_humidity;
-    float max_humidity;
-    float humidity_trend;
-    long record_count;
-    int best_year;
-    int worst_year;
-    float humidity_variance;
-} HumidityStats;
+// Global variables for multi-city data
+CityDroughtRisk cities[MAX_CITIES];
+int num_cities = 0;
+int total_records = 0;
 
-HumidityRecord* readHumidityCSV(const char* filename, long* count) {
-    FILE* file = fopen(filename, "r");
-    if (!file) {
-        printf("Error: Cannot open %s\n", filename);
-        return NULL;
-    }
+// Function declarations
+int parseCityHeaders(const char* header_line);
+void loadMultiCityData(const char* filepath);
+void calculateDRIForCity(CityDroughtRisk* city, float** humidity_data, int* record_count);
+void printTop3Cities(double process_time);
+int compareDRI(const void* a, const void* b);
 
-    char line[1024];
-    long lines = 0;
-    while (fgets(line, sizeof(line), file)) lines++;
-    rewind(file);
+// Parse city names from header line
+int parseCityHeaders(const char* header_line) {
+    char* token;
+    char line_copy[MAX_LINE_LENGTH];
+    int column = 0;
 
-    // Skip header line
-    if (fgets(line, sizeof(line), file) == NULL) {
-        printf("Error: Empty file or header read failed\n");
-        fclose(file);
-        return NULL;
-    }
-    lines--;
+    strcpy(line_copy, header_line);
 
-    if (lines <= 0) {
-        printf("Error: No data records found in file\n");
-        fclose(file);
-        return NULL;
-    }
+    // Skip datetime column
+    token = strtok(line_copy, ",");
+    column++;
 
-    HumidityRecord* records = malloc(lines * sizeof(HumidityRecord));
-    if (!records) {
-        printf("Error: Memory allocation failed for %ld records\n", lines);
-        fclose(file);
-        return NULL;
-    }
-
-    long count_read = 0;
-    long line_number = 2; // Start after header
-
-    while (fgets(line, sizeof(line), file) && count_read < lines) {
-        HumidityRecord r;
-        if (sscanf(line, "%d,%d,%f", &r.year, &r.month, &r.humidity) == 3) {
-            // Basic validation
-            if (r.year < 1900 || r.year > 2100 || r.month < 1 || r.month > 12) {
-                printf("Warning: Invalid date %d/%d at line %ld, skipping\n", r.year, r.month, line_number);
-                line_number++;
-                continue;
-            }
-            records[count_read++] = r;
-        } else {
-            printf("Warning: Malformed line %ld, skipping: %s", line_number, line);
+    // Parse city names
+    while ((token = strtok(NULL, ",")) != NULL && num_cities < MAX_CITIES) {
+        if (strlen(token) > 0) {
+            strcpy(cities[num_cities].city_name, token);
+            cities[num_cities].data_column = column;
+            cities[num_cities].dri_value = 0.0;
+            cities[num_cities].avg_humidity = 0.0;
+            cities[num_cities].trend_slope = 0.0;
+            cities[num_cities].dry_days = 0;
+            cities[num_cities].total_records = 0;
+            num_cities++;
         }
-        line_number++;
+        column++;
     }
 
+    return num_cities;
+}
+
+// Load multi-city data from CSV
+void loadMultiCityData(const char* filepath) {
+    FILE* file = fopen(filepath, "r");
+    if (!file) {
+        fprintf(stderr, "Error: Cannot open file %s\n", filepath);
+        return;
+    }
+
+    char line[MAX_LINE_LENGTH];
+
+    // Read header line
+    if (fgets(line, sizeof(line), file)) {
+        parseCityHeaders(line);
+    }
+
+    // Close file for now - we'll process data more efficiently
+    fclose(file);
+}
+
+// Calculate DRI for a single city
+void calculateDRIForCity(CityDroughtRisk* city, float** humidity_data, int* record_count) {
+    if (city->total_records == 0) return;
+
+    // Calculate basic statistics
+    double sum = 0.0;
+    long dry_days = 0;
+
+    for (int i = 0; i < city->total_records; i++) {
+        float humidity = humidity_data[city->data_column][i];
+        sum += humidity;
+        if (humidity < 30.0f) {
+            dry_days++;
+        }
+    }
+
+    city->avg_humidity = sum / city->total_records;
+    city->dry_days = dry_days;
+
+    // Calculate HFI - Humidity Frequency Index
+    double HFI = (double)dry_days / city->total_records;
+
+    // Calculate HSI - Humidity Severity Index
+    double avg_ratio = city->avg_humidity / 100.0;
+    double HSI = (1.0 - avg_ratio) * 0.6;  // Simplified version
+
+    // Calculate HTI - Humidity Trend Index (simplified linear trend)
+    if (city->total_records > 100) {
+        int first_half = city->total_records / 2;
+        double first_avg = 0.0, second_avg = 0.0;
+
+        for (int i = 0; i < first_half; i++) {
+            first_avg += humidity_data[city->data_column][i];
+        }
+        first_avg /= first_half;
+
+        for (int i = first_half; i < city->total_records; i++) {
+            second_avg += humidity_data[city->data_column][i];
+        }
+        second_avg /= (city->total_records - first_half);
+
+        city->trend_slope = (second_avg - first_avg) / (city->total_records / 2.0) * 100.0;
+    }
+
+    double HTI = (city->trend_slope < 0) ? (-city->trend_slope / 2.0) : 0.0;
+    if (HTI > 1.0) HTI = 1.0;
+
+    // Calculate HVI - Humidity Volatility Index (simplified)
+    double volatility = 0.0;
+    if (city->total_records > 1) {
+        for (int i = 1; i < city->total_records; i++) {
+            volatility += fabs(humidity_data[city->data_column][i] - humidity_data[city->data_column][i-1]);
+        }
+        volatility /= (city->total_records - 1);
+    }
+    double HVI = volatility / 100.0;
+    if (HVI > 1.0) HVI = 1.0;
+
+    // Calculate final DRI
+    city->dri_value = 0.35 * HFI + 0.30 * HSI + 0.20 * HTI + 0.15 * HVI;
+    if (city->dri_value > 1.0) city->dri_value = 1.0;
+}
+
+// Comparison function for sorting
+int compareDRI(const void* a, const void* b) {
+    CityDroughtRisk* cityA = (CityDroughtRisk*)a;
+    CityDroughtRisk* cityB = (CityDroughtRisk*)b;
+    if (cityB->dri_value > cityA->dri_value) return 1;
+    if (cityB->dri_value < cityA->dri_value) return -1;
+    return 0;
+}
+
+// Process all data and calculate DRI for all cities
+void processAllData(const char* filepath) {
+    FILE* file = fopen(filepath, "r");
+    if (!file) return;
+
+    char line[MAX_LINE_LENGTH];
+
+    // Skip header
+    fgets(line, sizeof(line), file);
+
+    // Allocate memory for humidity data (dynamic 2D array)
+    float** humidity_data = (float**)malloc((num_cities + 5) * sizeof(float*));
+    for (int i = 0; i < num_cities + 5; i++) {
+        humidity_data[i] = (float*)malloc(100000 * sizeof(float));  // Assuming max 100k records
+    }
+
+    int record_count = 0;
+
+    // Read data line by line
+    while (fgets(line, sizeof(line), file) && record_count < 100000) {
+        char* token = strtok(line, ",");
+        int column = 0;
+
+        // Skip datetime column
+        column++;
+
+        // Read humidity values for each city
+        while ((token = strtok(NULL, ",")) != NULL && column < num_cities + 5) {
+            float humidity = atof(token);
+            if (humidity > 0.0f && humidity <= 100.0f) {
+                humidity_data[column][record_count] = humidity;
+                if (column - 1 < num_cities) {
+                    cities[column - 1].total_records++;
+                }
+            }
+            column++;
+        }
+        record_count++;
+    }
+
+    total_records = record_count;
     fclose(file);
 
-    if (count_read == 0) {
-        printf("Error: No valid records found in file\n");
-        free(records);
-        return NULL;
+    // Calculate DRI for each city
+    for (int i = 0; i < num_cities; i++) {
+        calculateDRIForCity(&cities[i], humidity_data, &record_count);
     }
 
-    *count = count_read;
-    printf("Loaded %ld humidity records (out of %ld lines processed)\n", count_read, lines);
-    return records;
+    // Sort cities by DRI
+    qsort(cities, num_cities, sizeof(CityDroughtRisk), compareDRI);
+
+    // Free memory
+    for (int i = 0; i < num_cities + 5; i++) {
+        free(humidity_data[i]);
+    }
+    free(humidity_data);
 }
 
-HumidityStats analyzeSequential(HumidityRecord* records, long count) {
-    HumidityStats stats = {0};
-    stats.record_count = count;
+// Print top 3 cities with highest drought risk
+void printTop3Cities(double process_time) {
+    printf("Dataset: %d records\n", total_records);
+    printf("Top 3 Drought Risk Cities:\n");
 
-    if (count == 0) return stats;
-
-    clock_t start = clock();
-
-    float sum_humidity = 0;
-    float sum_xy = 0, sum_x = 0, sum_y = 0, sum_x2 = 0;
-    int min_year = 9999, max_year = 0;
-    bool first_valid = true;
-    long valid_count = 0;
-
-    for (long i = 0; i < count; i++) {
-        HumidityRecord* r = &records[i];
-
-        // Input validation - ensure humidity is in reasonable range
-        if (r->humidity < 0.0f || r->humidity > 100.0f) {
-            printf("Warning: Invalid humidity value %.1f at record %ld, skipping\n", r->humidity, i);
-            continue;
-        }
-
-        sum_humidity += r->humidity;
-        valid_count++;
-
-        // Initialize min/max on first valid record
-        if (first_valid) {
-            stats.min_humidity = r->humidity;
-            stats.max_humidity = r->humidity;
-            min_year = r->year;
-            max_year = r->year;
-            first_valid = false;
-        } else {
-            if (r->humidity < stats.min_humidity) stats.min_humidity = r->humidity;
-            if (r->humidity > stats.max_humidity) stats.max_humidity = r->humidity;
-        }
-
-        if (r->year < min_year) min_year = r->year;
-        if (r->year > max_year) max_year = r->year;
-
-        sum_x += r->year;
-        sum_y += r->humidity;
-        sum_xy += r->year * r->humidity;
-        sum_x2 += r->year * r->year;
+    for (int i = 0; i < 3 && i < num_cities; i++) {
+        printf("%d. %s (DRI: %.3f)\n", i + 1, cities[i].city_name, cities[i].dri_value);
     }
 
-    if (valid_count == 0) {
-        printf("Error: No valid humidity records found\n");
-        stats.mean_humidity = 0.0f;
-        stats.min_humidity = 0.0f;
-        stats.max_humidity = 0.0f;
-        stats.humidity_trend = 0.0f;
-        stats.humidity_variance = 0.0f;
-        stats.best_year = 0;
-        stats.worst_year = 0;
-        clock_t end = clock();
-        double elapsed = ((double)(end - start)) / CLOCKS_PER_SEC;
-        printf("Sequential processing time: %.3f seconds\n", elapsed);
-        return stats;
-    }
-
-    stats.mean_humidity = sum_humidity / valid_count;
-
-    long n = valid_count;  // Use valid_count for trend calculation
-    float denominator = (n * sum_x2 - sum_x * sum_x);
-    float slope = 0.0f;
-    if (fabsf(denominator) > 1e-10f) {  // Avoid division by zero
-        slope = (n * sum_xy - sum_x * sum_y) / denominator;
-    }
-    stats.humidity_trend = slope;
-
-    float variance_sum = 0;
-    for (long i = 0; i < count; i++) {
-        if (records[i].humidity >= 0.0f && records[i].humidity <= 100.0f) {
-            float diff = records[i].humidity - stats.mean_humidity;
-            variance_sum += diff * diff;
-        }
-    }
-    stats.humidity_variance = sqrtf(variance_sum / valid_count);
-
-    int year_range = max_year - min_year + 1;
-    if (year_range <= 0 || year_range > 1000) {  // Reasonable bounds check
-        printf("Warning: Invalid year range %d to %d, skipping yearly analysis\n", min_year, max_year);
-        stats.best_year = min_year;
-        stats.worst_year = max_year;
-        clock_t end = clock();
-        double elapsed = ((double)(end - start)) / CLOCKS_PER_SEC;
-        printf("Sequential processing time: %.3f seconds\n", elapsed);
-        return stats;
-    }
-
-    float* yearly_humidities = calloc(year_range, sizeof(float));
-    int* yearly_counts = calloc(year_range, sizeof(int));
-
-    if (!yearly_humidities || !yearly_counts) {
-        printf("Error: Memory allocation failed for yearly analysis\n");
-        stats.best_year = min_year;
-        stats.worst_year = max_year;
-        clock_t end = clock();
-        double elapsed = ((double)(end - start)) / CLOCKS_PER_SEC;
-        printf("Sequential processing time: %.3f seconds\n", elapsed);
-        return stats;
-    }
-
-    for (long i = 0; i < count; i++) {
-        int idx = records[i].year - min_year;
-        if (idx >= 0 && idx < year_range) {  // Bounds checking
-            yearly_humidities[idx] += records[i].humidity;
-            yearly_counts[idx]++;
-        }
-    }
-
-    float max_avg = -999, min_avg = 999;
-    for (int year = min_year; year <= max_year; year++) {
-        int idx = year - min_year;
-        if (yearly_counts[idx] > 0) {
-            float avg = yearly_humidities[idx] / yearly_counts[idx];
-            if (avg > max_avg) {
-                max_avg = avg;
-                stats.best_year = year;
-            }
-            if (avg < min_avg) {
-                min_avg = avg;
-                stats.worst_year = year;
-            }
-        }
-    }
-
-    free(yearly_humidities);
-    free(yearly_counts);
-
-    clock_t end = clock();
-    double elapsed = ((double)(end - start)) / CLOCKS_PER_SEC;
-    printf("Sequential processing time: %.3f seconds\n", elapsed);
-
-    return stats;
+    printf("Time: %.3f seconds\n", process_time);
 }
 
-void printResults(HumidityStats stats, double elapsed) {
-    printf("\n=== SEQUENTIAL CPU RESULTS ===\n");
-    printf("Records processed: %ld\n", stats.record_count);
-    printf("Processing time: %.3f seconds\n", elapsed);
-    printf("Performance: %.0f records/second\n", stats.record_count / elapsed);
-    printf("\n📊 HUMIDITY ANALYSIS RESULTS:\n");
-    printf("• Mean Humidity: %.1f%%\n", stats.mean_humidity);
-    printf("• Humidity Range: %.1f%% to %.1f%%\n", stats.min_humidity, stats.max_humidity);
-    printf("• Humidity Volatility: %.1f%% (std dev)\n", stats.humidity_variance);
-
-    if (stats.humidity_trend > 0) {
-        printf("• 📈 Humidity Trend: +%.3f%% per year (INCREASING)\n", stats.humidity_trend);
-    } else if (stats.humidity_trend < 0) {
-        printf("• 📉 Humidity Trend: %.3f%% per year (DECREASING)\n", stats.humidity_trend);
-    } else {
-        printf("• 📊 Humidity Trend: Stable\n");
+// Main program
+int program_execution(int parameter_count, char* parameter_values[]) {
+    if (parameter_count != 2) {
+        fprintf(stderr, "Usage: %s <humidity_data.csv>\n", parameter_values[0]);
+        return EXIT_FAILURE;
     }
 
-    printf("• Best Year: %d\n", stats.best_year);
-    printf("• Worst Year: %d\n", stats.worst_year);
+    clock_t start_time = clock();
 
-    printf("\n🎯 HUMIDITY Comfort Assessment:\n");
-    if (stats.mean_humidity > 70 && stats.mean_humidity < 80) {
-        printf("• Status: COMFORTABLE humidity levels\n");
-        printf("• Recommendation: Maintain current conditions\n");
-    } else if (stats.mean_humidity >= 60 && stats.mean_humidity <= 85) {
-        printf("• Status: ACCEPTABLE humidity levels\n");
-        printf("• Recommendation: Minor adjustments suggested\n");
-    } else {
-        printf("• Status: UNCOMFORTABLE humidity levels\n");
-        printf("• Recommendation: Significant adjustments needed\n");
-    }
+    loadMultiCityData(parameter_values[1]);
+    processAllData(parameter_values[1]);
 
-    printf("========================================\n\n");
+    clock_t end_time = clock();
+    double process_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+
+    printTop3Cities(process_time);
+
+    return EXIT_SUCCESS;
 }
 
+// Standard main function wrapper
 int main(int argc, char* argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <humidity_data.csv>\n", argv[0]);
-        return 1;
-    }
-
-    printf("Sequential Humidity Analysis - OPTIMAL CPU IMPLEMENTATION\n");
-    printf("==========================================================\n");
-
-    clock_t total_start = clock();
-
-    long count;
-    HumidityRecord* records = readHumidityCSV(argv[1], &count);
-    if (!records) return 1;
-
-    HumidityStats stats = analyzeSequential(records, count);
-
-    clock_t total_end = clock();
-    double total_elapsed = ((double)(total_end - total_start)) / CLOCKS_PER_SEC;
-
-    printResults(stats, total_elapsed);
-
-    free(records);
-    return 0;
+    return program_execution(argc, argv);
 }
