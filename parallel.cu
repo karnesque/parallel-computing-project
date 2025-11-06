@@ -15,6 +15,15 @@
 #define MAX_CITY_NAME_LENGTH 50
 #define MAX_LINE_LENGTH 2048
 
+// CUDA Error checking macro
+#define CHECK_CUDA(call) do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA Error at %s:%d - %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
 // City drought risk data
 typedef struct {
     char city_name[MAX_CITY_NAME_LENGTH];
@@ -192,9 +201,10 @@ void processAllDataGPU(const char* filepath) {
     // Skip header
     fgets(line, sizeof(line), file);
 
-    // Allocate memory for humidity data
-    float** humidity_data = (float**)malloc((num_cities + 5) * sizeof(float*));
-    for (int i = 0; i < num_cities + 5; i++) {
+    // Allocate memory for humidity data (datetime + actual cities)
+    int total_columns = num_cities + 1; // datetime column + city columns
+    float** humidity_data = (float**)malloc(total_columns * sizeof(float*));
+    for (int i = 0; i < total_columns; i++) {
         humidity_data[i] = (float*)malloc(100000 * sizeof(float));
     }
 
@@ -208,11 +218,11 @@ void processAllDataGPU(const char* filepath) {
         // Skip datetime column
         column++;
 
-        while ((token = strtok(NULL, ",")) != NULL && column < num_cities + 5) {
+        while ((token = strtok(NULL, ",")) != NULL && column < total_columns) {
             float humidity = atof(token);
             if (humidity > 0.0f && humidity <= 100.0f) {
                 humidity_data[column][record_count] = humidity;
-                if (column - 1 < num_cities) {
+                if (column > 0 && column - 1 < num_cities) {  // Skip datetime column
                     cities[column - 1].total_records++;
                 }
             }
@@ -233,67 +243,60 @@ void processAllDataGPU(const char* filepath) {
     double* device_dri_values;
     float* device_humidity_data;
 
-    // Allocate device memory
-    cudaError_t err;
-    err = cudaMalloc(&device_record_counts, num_cities * sizeof(int));
-    if (err != cudaSuccess) printf("CUDA Error 1: %s\n", cudaGetErrorString(err));
-
-    err = cudaMalloc(&device_avg_humidity, num_cities * sizeof(double));
-    if (err != cudaSuccess) printf("CUDA Error 2: %s\n", cudaGetErrorString(err));
-
-    err = cudaMalloc(&device_dry_days, num_cities * sizeof(long));
-    if (err != cudaSuccess) printf("CUDA Error 3: %s\n", cudaGetErrorString(err));
-
-    err = cudaMalloc(&device_trend_slopes, num_cities * sizeof(double));
-    if (err != cudaSuccess) printf("CUDA Error 4: %s\n", cudaGetErrorString(err));
-
-    err = cudaMalloc(&device_volatility, num_cities * sizeof(double));
-    if (err != cudaSuccess) printf("CUDA Error 5: %s\n", cudaGetErrorString(err));
-
-    err = cudaMalloc(&device_dri_values, num_cities * sizeof(double));
-    if (err != cudaSuccess) printf("CUDA Error 6: %s\n", cudaGetErrorString(err));
-
-    err = cudaMalloc(&device_humidity_data, num_cities * total_records * sizeof(float));
-    if (err != cudaSuccess) printf("CUDA Error 7: %s\n", cudaGetErrorString(err));
+    // Allocate device memory with proper error checking
+    CHECK_CUDA(cudaMalloc(&device_record_counts, num_cities * sizeof(int)));
+    CHECK_CUDA(cudaMalloc(&device_avg_humidity, num_cities * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&device_dry_days, num_cities * sizeof(long)));
+    CHECK_CUDA(cudaMalloc(&device_trend_slopes, num_cities * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&device_volatility, num_cities * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&device_dri_values, num_cities * sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&device_humidity_data, num_cities * total_records * sizeof(float)));
 
     // Copy record counts to device
     int* host_record_counts = (int*)malloc(num_cities * sizeof(int));
     for (int i = 0; i < num_cities; i++) {
         host_record_counts[i] = cities[i].total_records;
     }
-    cudaMemcpy(device_record_counts, host_record_counts, num_cities * sizeof(int), cudaMemcpyHostToDevice);
+    CHECK_CUDA(cudaMemcpy(device_record_counts, host_record_counts, num_cities * sizeof(int), cudaMemcpyHostToDevice));
 
-    // Copy humidity data to device (flatten 2D array)
+    // Copy humidity data to device (flatten 2D array) - FIXED MAPPING
     float* flattened_data = (float*)malloc(num_cities * total_records * sizeof(float));
     for (int city = 0; city < num_cities; city++) {
+        int actual_column = cities[city].data_column;  // Use real column index
         for (int record = 0; record < cities[city].total_records; record++) {
-            flattened_data[city * total_records + record] = humidity_data[city][record];
+            flattened_data[city * total_records + record] = humidity_data[actual_column][record];
         }
     }
-    cudaMemcpy(device_humidity_data, flattened_data, num_cities * total_records * sizeof(float), cudaMemcpyHostToDevice);
+    CHECK_CUDA(cudaMemcpy(device_humidity_data, flattened_data, num_cities * total_records * sizeof(float), cudaMemcpyHostToDevice));
 
     // Configure kernel launch parameters
     int threads_per_block = 256;
     int blocks_per_grid = (num_cities + threads_per_block - 1) / threads_per_block;
 
-    // Launch kernels
+    // Launch kernels with error checking
     calculateBasicStats<<<blocks_per_grid, threads_per_block>>>(
         device_humidity_data, device_record_counts, device_avg_humidity,
         device_dry_days, num_cities, total_records);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     calculateTrends<<<blocks_per_grid, threads_per_block>>>(
         device_humidity_data, device_record_counts, device_trend_slopes,
         num_cities, total_records);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     calculateVolatility<<<blocks_per_grid, threads_per_block>>>(
         device_humidity_data, device_record_counts, device_volatility,
         num_cities, total_records);
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     calculateDRI<<<blocks_per_grid, threads_per_block>>>(
         device_avg_humidity, device_dry_days, device_record_counts,
         device_trend_slopes, device_volatility, device_dri_values, num_cities);
-
-    cudaDeviceSynchronize();
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
 
     // Copy results back to host
     double* host_avg_humidity = (double*)malloc(num_cities * sizeof(double));
@@ -302,11 +305,11 @@ void processAllDataGPU(const char* filepath) {
     double* host_volatility = (double*)malloc(num_cities * sizeof(double));
     double* host_dri_values = (double*)malloc(num_cities * sizeof(double));
 
-    cudaMemcpy(host_avg_humidity, device_avg_humidity, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_dry_days, device_dry_days, num_cities * sizeof(long), cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_trend_slopes, device_trend_slopes, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_volatility, device_volatility, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
-    cudaMemcpy(host_dri_values, device_dri_values, num_cities * sizeof(double), cudaMemcpyDeviceToHost);
+    CHECK_CUDA(cudaMemcpy(host_avg_humidity, device_avg_humidity, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(host_dry_days, device_dry_days, num_cities * sizeof(long), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(host_trend_slopes, device_trend_slopes, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(host_volatility, device_volatility, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(host_dri_values, device_dri_values, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
 
     // Update cities data
     for (int i = 0; i < num_cities; i++) {
@@ -319,16 +322,17 @@ void processAllDataGPU(const char* filepath) {
     // Sort cities by DRI using CPU
     qsort(cities, num_cities, sizeof(CityDroughtRisk), compareDRI);
 
-    // Free memory
-    cudaFree(device_record_counts);
-    cudaFree(device_avg_humidity);
-    cudaFree(device_dry_days);
-    cudaFree(device_trend_slopes);
-    cudaFree(device_volatility);
-    cudaFree(device_dri_values);
-    cudaFree(device_humidity_data);
+    // Free device memory
+    CHECK_CUDA(cudaFree(device_record_counts));
+    CHECK_CUDA(cudaFree(device_avg_humidity));
+    CHECK_CUDA(cudaFree(device_dry_days));
+    CHECK_CUDA(cudaFree(device_trend_slopes));
+    CHECK_CUDA(cudaFree(device_volatility));
+    CHECK_CUDA(cudaFree(device_dri_values));
+    CHECK_CUDA(cudaFree(device_humidity_data));
 
-    for (int i = 0; i < num_cities + 5; i++) {
+    // Free host memory
+    for (int i = 0; i < total_columns; i++) {
         free(humidity_data[i]);
     }
     free(humidity_data);
