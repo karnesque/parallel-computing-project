@@ -5,17 +5,19 @@
 #include <time.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
-#include <thrust/device_vector.h>
-#include <thrust/reduce.h>
-#include <thrust/extrema.h>
-#include <thrust/transform_reduce.h>
-#include <thrust/sort.h>
 
 #define MAX_CITIES 50
 #define MAX_CITY_NAME_LENGTH 50
 #define MAX_LINE_LENGTH 2048
+#define MAX_RECORDS_CAP 100000
 
-// CUDA Error checking macro
+#ifdef _WIN32
+  #define STRTOK(str, delim, saveptr) strtok_s((str), (delim), (saveptr))
+#else
+  #define STRTOK(str, delim, saveptr) strtok_r((str), (delim), (saveptr))
+#endif
+
+// ---------- CUDA error check ----------
 #define CHECK_CUDA(call) do { \
     cudaError_t err = call; \
     if (err != cudaSuccess) { \
@@ -24,141 +26,237 @@
     } \
 } while(0)
 
-// City drought risk data
+// ---------- atomicAdd helpers ----------
+// รองรับการ์ด < sm_60 สำหรับ double
+#if __CUDA_ARCH__ < 600 && defined(__CUDA_ARCH__)
+__device__ double atomicAdd_double(double* address, double val) {
+    unsigned long long int* addr_as_ull =
+        reinterpret_cast<unsigned long long int*>(address);
+    unsigned long long int old = *addr_as_ull, assumed;
+    do {
+        assumed = old;
+        double sum = __longlong_as_double(assumed) + val;
+        old = atomicCAS(addr_as_ull, assumed, __double_as_longlong(sum));
+    } while (assumed != old);
+    return __longlong_as_double(old);
+}
+#define ATOMIC_ADD_D(addr, v) atomicAdd_double((addr), (v))
+#else
+#define ATOMIC_ADD_D(addr, v) atomicAdd((addr), (v))
+#endif
+
+// ใช้กับ long long โดย cast เป็น unsigned long long*
+#define ATOMIC_ADD_LL(addr_ll, v_ll) \
+    atomicAdd(reinterpret_cast<unsigned long long*>(addr_ll), static_cast<unsigned long long>(v_ll))
+
 typedef struct {
     char city_name[MAX_CITY_NAME_LENGTH];
     double dri_value;
     double avg_humidity;
     double trend_slope;
-    long dry_days;
+    long long dry_days;
     long total_records;
     int data_column;
 } CityDroughtRisk;
 
-// GPU kernels for parallel computation
-__global__ void calculateBasicStats(float* humidity_data, int* record_counts,
-                                   double* avg_humidity, long* dry_days,
-                                   int num_cities, int total_records) {
-    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
+__device__ __forceinline__ double clamp01(double x) {
+    if (x < 0.0) return 0.0;
+    if (x > 1.0) return 1.0;
+    return x;
+}
 
-    if (city_idx < num_cities && record_counts[city_idx] > 0) {
-        double sum = 0.0;
-        long dry_count = 0;
+// ---------- Warp reduce helpers ----------
+__inline__ __device__ double warpReduceSumD(double v){
+    for(int o=16;o>0;o>>=1) v += __shfl_down_sync(0xffffffff, v, o);
+    return v;
+}
+__inline__ __device__ long long warpReduceSumLL(long long v){
+    for(int o=16;o>0;o>>=1) v += __shfl_down_sync(0xffffffff, v, o);
+    return v;
+}
 
-        for (int i = 0; i < record_counts[city_idx]; i++) {
-            float humidity = humidity_data[city_idx * total_records + i];
-            sum += humidity;
-            if (humidity < 30.0f) {
-                dry_count++;
-            }
+// ========== Phase 1: Accumulate (multi-block per city) ==========
+__global__ void accumulate_city_stats(
+    const float* __restrict__ humidity, // [num_cities * stride]
+    const int*   __restrict__ counts,   // [num_cities]
+    double* __restrict__ sum_out,       // [num_cities]
+    double* __restrict__ absdiff_out,   // [num_cities]
+    double* __restrict__ first_out,     // [num_cities]
+    double* __restrict__ second_out,    // [num_cities]
+    long long* __restrict__ dry_out,    // [num_cities]
+    int stride, int num_cities, int kBlocksPerCity
+){
+    int global_block = blockIdx.x;
+    int city = global_block % num_cities;
+    int n = counts[city];
+    if (n <= 0) return;
+
+    const float* base = humidity + city * stride;
+    int tid = threadIdx.x;
+    int block_id_for_city = global_block / num_cities;
+    int cityWideStride = blockDim.x * kBlocksPerCity;
+
+    double sum=0.0, absdiff=0.0, first=0.0, second=0.0;
+    long long dry=0;
+
+    int half = n/2;
+    bool do_trend = (n > 100);
+
+    for (int i = tid + block_id_for_city * blockDim.x; i < n; i += cityWideStride) {
+        float h = __ldg(&base[i]);
+        sum += h;
+        if (h < 30.0f) dry++;
+        if (i > 0) {
+            float prev = __ldg(&base[i - 1]);
+            absdiff += fabsf(h - prev);
         }
+        if (do_trend) {
+            if (i < half) first += h;
+            else          second += h;
+        }
+    }
 
-        avg_humidity[city_idx] = sum / record_counts[city_idx];
-        dry_days[city_idx] = dry_count;
+    // warp reduce
+    sum     = warpReduceSumD(sum);
+    absdiff = warpReduceSumD(absdiff);
+    first   = warpReduceSumD(first);
+    second  = warpReduceSumD(second);
+    dry     = warpReduceSumLL(dry);
+
+    __shared__ double s_sum[32], s_abs[32], s_fst[32], s_snd[32];
+    __shared__ long long s_dry[32];
+
+    if ((tid & 31) == 0) {
+        int wid = tid >> 5;
+        s_sum[wid] = sum;
+        s_abs[wid] = absdiff;
+        s_fst[wid] = first;
+        s_snd[wid] = second;
+        s_dry[wid] = dry;
+    }
+    __syncthreads();
+
+    if (tid < 32) {
+        int limit = blockDim.x >> 5;
+        double bsum=0.0, babs=0.0, bfst=0.0, bsnd=0.0;
+        long long bdry=0;
+        #pragma unroll
+        for (int w=0; w<limit; ++w) {
+            bsum += s_sum[w];
+            babs += s_abs[w];
+            bfst += s_fst[w];
+            bsnd += s_snd[w];
+            bdry += s_dry[w];
+        }
+        if (tid == 0) {
+            ATOMIC_ADD_D(&sum_out[city],     bsum);
+            ATOMIC_ADD_D(&absdiff_out[city], babs);
+            ATOMIC_ADD_D(&first_out[city],   bfst);
+            ATOMIC_ADD_D(&second_out[city],  bsnd);
+            ATOMIC_ADD_LL(&dry_out[city],    bdry);  // signed -> unsigned cast
+        }
     }
 }
 
-__global__ void calculateTrends(float* humidity_data, int* record_counts,
-                               double* trend_slopes, int num_cities, int total_records) {
-    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
+// ========== Phase 2: Finalize per city ==========
+__global__ void finalize_city_stats(
+    const double* __restrict__ sum_in,
+    const double* __restrict__ absdiff_in,
+    const double* __restrict__ first_in,
+    const double* __restrict__ second_in,
+    const long long* __restrict__ dry_in,
+    const int* __restrict__ counts,
+    double* __restrict__ avg_out,
+    double* __restrict__ slope_out,
+    double* __restrict__ vol_out,
+    double* __restrict__ dri_out,
+    int num_cities
+){
+    int city = blockIdx.x * blockDim.x + threadIdx.x;
+    if (city >= num_cities) return;
 
-    if (city_idx < num_cities && record_counts[city_idx] > 100) {
-        int half_count = record_counts[city_idx] / 2;
-        double first_half_sum = 0.0, second_half_sum = 0.0;
-
-        for (int i = 0; i < half_count; i++) {
-            first_half_sum += humidity_data[city_idx * total_records + i];
-        }
-
-        for (int i = half_count; i < record_counts[city_idx]; i++) {
-            second_half_sum += humidity_data[city_idx * total_records + i];
-        }
-
-        double first_avg = first_half_sum / half_count;
-        double second_avg = second_half_sum / (record_counts[city_idx] - half_count);
-
-        trend_slopes[city_idx] = (second_avg - first_avg) / half_count * 100.0;
-    } else {
-        trend_slopes[city_idx] = 0.0;
+    int n = counts[city];
+    if (n <= 0) {
+        avg_out[city]=0.0; slope_out[city]=0.0; vol_out[city]=0.0; dri_out[city]=0.0;
+        return;
     }
-}
 
-__global__ void calculateVolatility(float* humidity_data, int* record_counts,
-                                   double* volatility, int num_cities, int total_records) {
-    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    double avg = sum_in[city] / (double)n;
+    double vol = (n > 1) ? (absdiff_in[city] / (double)(n - 1)) : 0.0;
 
-    if (city_idx < num_cities && record_counts[city_idx] > 1) {
-        double total_change = 0.0;
-
-        for (int i = 1; i < record_counts[city_idx]; i++) {
-            float curr = humidity_data[city_idx * total_records + i];
-            float prev = humidity_data[city_idx * total_records + i - 1];
-            total_change += fabs(curr - prev);
-        }
-
-        volatility[city_idx] = total_change / (record_counts[city_idx] - 1);
-    } else {
-        volatility[city_idx] = 0.0;
+    int half = n/2;
+    double slope = 0.0;
+    if (n > 100 && half > 0 && (n - half) > 0) {
+        double first_avg  = first_in[city]  / (double)half;
+        double second_avg = second_in[city] / (double)(n - half);
+        slope = (second_avg - first_avg) / (double)half * 100.0;
     }
+
+    double HFI = (double)dry_in[city] / (double)n;
+    double HSI = (1.0 - (avg / 100.0)) * 0.6;
+    double HTI = (slope < 0.0) ? (-slope / 2.0) : 0.0;
+    double HVI = vol / 100.0;
+
+    if (HSI < 0.0) HSI = 0.0; if (HSI > 1.0) HSI = 1.0;
+    if (HTI < 0.0) HTI = 0.0; if (HTI > 1.0) HTI = 1.0;
+    if (HVI < 0.0) HVI = 0.0; if (HVI > 1.0) HVI = 1.0;
+
+    double DRI = 0.35*HFI + 0.30*HSI + 0.20*HTI + 0.15*HVI;
+    if (DRI < 0.0) DRI = 0.0; if (DRI > 1.0) DRI = 1.0;
+
+    avg_out[city]   = avg;
+    slope_out[city] = slope;
+    vol_out[city]   = vol;
+    dri_out[city]   = DRI;
 }
 
-__global__ void calculateDRI(double* avg_humidity, long* dry_days, int* record_counts,
-                            double* trend_slopes, double* volatility, double* dri_values,
-                            int num_cities) {
-    int city_idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (city_idx < num_cities && record_counts[city_idx] > 0) {
-        // HFI - Humidity Frequency Index
-        double HFI = (double)dry_days[city_idx] / record_counts[city_idx];
-
-        // HSI - Humidity Severity Index
-        double avg_ratio = avg_humidity[city_idx] / 100.0;
-        double HSI = (1.0 - avg_ratio) * 0.6;
-
-        // HTI - Humidity Trend Index
-        double HTI = (trend_slopes[city_idx] < 0) ? (-trend_slopes[city_idx] / 2.0) : 0.0;
-        if (HTI > 1.0) HTI = 1.0;
-
-        // HVI - Humidity Volatility Index
-        double HVI = volatility[city_idx] / 100.0;
-        if (HVI > 1.0) HVI = 1.0;
-
-        // Calculate final DRI
-        dri_values[city_idx] = 0.35 * HFI + 0.30 * HSI + 0.20 * HTI + 0.15 * HVI;
-        if (dri_values[city_idx] > 1.0) dri_values[city_idx] = 1.0;
-    }
-}
-
-// Comparison function for sorting
-int compareDRI(const void* a, const void* b) {
-    CityDroughtRisk* cityA = (CityDroughtRisk*)a;
-    CityDroughtRisk* cityB = (CityDroughtRisk*)b;
-    if (cityB->dri_value > cityA->dri_value) return 1;
-    if (cityB->dri_value < cityA->dri_value) return -1;
-    return 0;
-}
-
-// Global variables
+// ---------- Host globals ----------
 CityDroughtRisk cities[MAX_CITIES];
 int num_cities = 0;
 int total_records = 0;
 
-// Parse city names from header line
+static inline void rtrim(char* s) {
+    int n = (int)strlen(s);
+    while (n > 0) {
+        char c = s[n - 1];
+        if (c=='\n'||c=='\r'||c==' '||c=='\t') s[--n]='\0'; else break;
+    }
+}
+static inline void ltrim(char* s) {
+    int i=0; while (s[i]==' '||s[i]=='\t') i++;
+    if (i>0) memmove(s, s+i, strlen(s)-i+1);
+}
+static inline void trim(char* s) {
+    rtrim(s); ltrim(s);
+    if (s[0]=='"'||s[0]=='\'') {
+        size_t len=strlen(s);
+        if (len>=2 && s[len-1]==s[0]) { s[len-1]='\0'; memmove(s, s+1, len); }
+    }
+}
+
+int compareDRI(const void* a, const void* b) {
+    const CityDroughtRisk* A=(const CityDroughtRisk*)a;
+    const CityDroughtRisk* B=(const CityDroughtRisk*)b;
+    if (B->dri_value > A->dri_value) return 1;
+    if (B->dri_value < A->dri_value) return -1;
+    return strcmp(A->city_name, B->city_name);
+}
+
 int parseCityHeaders(const char* header_line) {
-    char* token;
     char line_copy[MAX_LINE_LENGTH];
-    int column = 0;
+    strncpy(line_copy, header_line, sizeof(line_copy));
+    line_copy[sizeof(line_copy)-1]='\0';
 
-    strcpy(line_copy, header_line);
+    char* saveptr=NULL;
+    char* token = STRTOK(line_copy, ",", &saveptr);
+    int column = 1; // หลัง datetime
 
-    // Skip datetime column
-    token = strtok(line_copy, ",");
-    column++;
-
-    // Parse city names
-    while ((token = strtok(NULL, ",")) != NULL && num_cities < MAX_CITIES) {
-        if (strlen(token) > 0) {
-            strcpy(cities[num_cities].city_name, token);
+    num_cities = 0;
+    while ((token = STRTOK(NULL, ",", &saveptr)) != NULL && num_cities < MAX_CITIES) {
+        trim(token);
+        if (strlen(token)>0) {
+            strncpy(cities[num_cities].city_name, token, MAX_CITY_NAME_LENGTH-1);
+            cities[num_cities].city_name[MAX_CITY_NAME_LENGTH-1]='\0';
             cities[num_cities].data_column = column;
             cities[num_cities].dri_value = 0.0;
             cities[num_cities].avg_humidity = 0.0;
@@ -169,210 +267,209 @@ int parseCityHeaders(const char* header_line) {
         }
         column++;
     }
-
     return num_cities;
 }
 
-// Load multi-city data from CSV
 void loadMultiCityData(const char* filepath) {
-    FILE* file = fopen(filepath, "r");
-    if (!file) {
-        fprintf(stderr, "Error: Cannot open file %s\n", filepath);
-        return;
-    }
-
+    FILE* f=fopen(filepath,"r");
+    if(!f){ fprintf(stderr,"Error: Cannot open %s\n", filepath); exit(EXIT_FAILURE); }
     char line[MAX_LINE_LENGTH];
-
-    // Read header line
-    if (fgets(line, sizeof(line), file)) {
-        parseCityHeaders(line);
+    if (!fgets(line, sizeof(line), f)) {
+        fprintf(stderr,"Error: empty file %s\n", filepath);
+        fclose(f); exit(EXIT_FAILURE);
     }
-
-    fclose(file);
+    parseCityHeaders(line);
+    fclose(f);
 }
 
-// Process all data with GPU acceleration
+// ========== Fast path with packing + multi-block ==========
 void processAllDataGPU(const char* filepath) {
-    FILE* file = fopen(filepath, "r");
-    if (!file) return;
+    FILE* file=fopen(filepath,"r");
+    if(!file){ fprintf(stderr,"Error: Cannot open %s\n", filepath); exit(EXIT_FAILURE); }
 
     char line[MAX_LINE_LENGTH];
+    if(!fgets(line,sizeof(line),file)){ fprintf(stderr,"Error: cannot read header again\n"); fclose(file); exit(EXIT_FAILURE); }
 
-    // Skip header
-    fgets(line, sizeof(line), file);
-
-    // Allocate memory for humidity data (datetime + actual cities)
-    int total_columns = num_cities + 1; // datetime column + city columns
-    float** humidity_data = (float**)malloc(total_columns * sizeof(float*));
-    for (int i = 0; i < total_columns; i++) {
-        humidity_data[i] = (float*)malloc(100000 * sizeof(float));
+    // packed per city
+    float** city_data = (float**)malloc(num_cities * sizeof(float*));
+    int* city_write = (int*)calloc(num_cities, sizeof(int));
+    if(!city_data||!city_write){ fprintf(stderr,"host alloc fail\n"); exit(EXIT_FAILURE); }
+    for(int i=0;i<num_cities;i++){
+        city_data[i]=(float*)malloc(MAX_RECORDS_CAP*sizeof(float));
+        if(!city_data[i]){ fprintf(stderr,"host alloc city %d fail\n",i); exit(EXIT_FAILURE); }
     }
 
-    int record_count = 0;
+    while(fgets(line,sizeof(line),file)) {
+        char* saveptr=NULL;
+        char* token = STRTOK(line, ",", &saveptr);
+        int column=0; (void)token; column++; // skip datetime
 
-    // Read data line by line
-    while (fgets(line, sizeof(line), file) && record_count < 100000) {
-        char* token = strtok(line, ",");
-        int column = 0;
+        while ((token = STRTOK(NULL, ",", &saveptr)) != NULL) {
+            if (column >= (num_cities+1)) break;
+            trim(token);
+            float h=(float)atof(token);
 
-        // Skip datetime column
-        column++;
-
-        while ((token = strtok(NULL, ",")) != NULL && column < total_columns) {
-            float humidity = atof(token);
-            if (humidity > 0.0f && humidity <= 100.0f) {
-                humidity_data[column][record_count] = humidity;
-                if (column > 0 && column - 1 < num_cities) {  // Skip datetime column
-                    cities[column - 1].total_records++;
-                }
+            int city_index=-1;
+            for(int i=0;i<num_cities;i++){
+                if(cities[i].data_column==column){ city_index=i; break; }
+            }
+            if (city_index>=0 && h>0.0f && h<=100.0f) {
+                int w=city_write[city_index];
+                if(w<MAX_RECORDS_CAP){ city_data[city_index][w]=h; city_write[city_index]=w+1; }
             }
             column++;
         }
-        record_count++;
     }
-
-    total_records = record_count;
     fclose(file);
 
-    // Prepare data for GPU
-    int* device_record_counts;
-    double* device_avg_humidity;
-    long* device_dry_days;
-    double* device_trend_slopes;
-    double* device_volatility;
-    double* device_dri_values;
-    float* device_humidity_data;
-
-    // Allocate device memory with proper error checking
-    CHECK_CUDA(cudaMalloc(&device_record_counts, num_cities * sizeof(int)));
-    CHECK_CUDA(cudaMalloc(&device_avg_humidity, num_cities * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&device_dry_days, num_cities * sizeof(long)));
-    CHECK_CUDA(cudaMalloc(&device_trend_slopes, num_cities * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&device_volatility, num_cities * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&device_dri_values, num_cities * sizeof(double)));
-    CHECK_CUDA(cudaMalloc(&device_humidity_data, num_cities * total_records * sizeof(float)));
-
-    // Copy record counts to device
-    int* host_record_counts = (int*)malloc(num_cities * sizeof(int));
-    for (int i = 0; i < num_cities; i++) {
-        host_record_counts[i] = cities[i].total_records;
+    int max_records=0;
+    for(int i=0;i<num_cities;i++){
+        cities[i].total_records = city_write[i];
+        if(city_write[i] > max_records) max_records = city_write[i];
     }
-    CHECK_CUDA(cudaMemcpy(device_record_counts, host_record_counts, num_cities * sizeof(int), cudaMemcpyHostToDevice));
+    total_records = max_records;
 
-    // Copy humidity data to device (flatten 2D array) - FIXED MAPPING
-    float* flattened_data = (float*)malloc(num_cities * total_records * sizeof(float));
-    for (int city = 0; city < num_cities; city++) {
-        int actual_column = cities[city].data_column;  // Use real column index
-        for (int record = 0; record < cities[city].total_records; record++) {
-            flattened_data[city * total_records + record] = humidity_data[actual_column][record];
+    size_t flatN = (size_t)num_cities * (size_t)max_records;
+
+    // pinned host memory → copy เร็วขึ้น
+    float* flattened_data = NULL;
+    CHECK_CUDA(cudaHostAlloc((void**)&flattened_data, flatN*sizeof(float), cudaHostAllocDefault));
+    memset(flattened_data, 0, flatN*sizeof(float));
+    for(int c=0;c<num_cities;c++){
+        int n=city_write[c];
+        if(n>0){
+            memcpy(flattened_data + (size_t)c*max_records, city_data[c], (size_t)n*sizeof(float));
         }
     }
-    CHECK_CUDA(cudaMemcpy(device_humidity_data, flattened_data, num_cities * total_records * sizeof(float), cudaMemcpyHostToDevice));
 
-    // Configure kernel launch parameters
-    int threads_per_block = 256;
-    int blocks_per_grid = (num_cities + threads_per_block - 1) / threads_per_block;
+    int* h_counts=(int*)malloc(num_cities*sizeof(int));
+    for(int i=0;i<num_cities;i++) h_counts[i]=city_write[i];
 
-    // Launch kernels with error checking
-    calculateBasicStats<<<blocks_per_grid, threads_per_block>>>(
-        device_humidity_data, device_record_counts, device_avg_humidity,
-        device_dry_days, num_cities, total_records);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    // ----- Device buffers -----
+    int *d_counts=NULL;
+    float *d_hum=NULL;
+    double *d_sum=NULL, *d_abs=NULL, *d_first=NULL, *d_second=NULL;
+    long long *d_dry=NULL;
+    double *d_avg=NULL, *d_slope=NULL, *d_vol=NULL, *d_dri=NULL;
 
-    calculateTrends<<<blocks_per_grid, threads_per_block>>>(
-        device_humidity_data, device_record_counts, device_trend_slopes,
-        num_cities, total_records);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMalloc(&d_counts, num_cities*sizeof(int)));
+    if(max_records>0) CHECK_CUDA(cudaMalloc(&d_hum, flatN*sizeof(float)));
 
-    calculateVolatility<<<blocks_per_grid, threads_per_block>>>(
-        device_humidity_data, device_record_counts, device_volatility,
-        num_cities, total_records);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMalloc(&d_sum,    num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_abs,    num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_first,  num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_second, num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_dry,    num_cities*sizeof(long long)));
 
-    calculateDRI<<<blocks_per_grid, threads_per_block>>>(
-        device_avg_humidity, device_dry_days, device_record_counts,
-        device_trend_slopes, device_volatility, device_dri_values, num_cities);
-    CHECK_CUDA(cudaGetLastError());
-    CHECK_CUDA(cudaDeviceSynchronize());
+    CHECK_CUDA(cudaMalloc(&d_avg,   num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_slope, num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_vol,   num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMalloc(&d_dri,   num_cities*sizeof(double)));
 
-    // Copy results back to host
-    double* host_avg_humidity = (double*)malloc(num_cities * sizeof(double));
-    long* host_dry_days = (long*)malloc(num_cities * sizeof(long));
-    double* host_trend_slopes = (double*)malloc(num_cities * sizeof(double));
-    double* host_volatility = (double*)malloc(num_cities * sizeof(double));
-    double* host_dri_values = (double*)malloc(num_cities * sizeof(double));
+    CHECK_CUDA(cudaFuncSetCacheConfig(accumulate_city_stats, cudaFuncCachePreferL1));
 
-    CHECK_CUDA(cudaMemcpy(host_avg_humidity, device_avg_humidity, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(host_dry_days, device_dry_days, num_cities * sizeof(long), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(host_trend_slopes, device_trend_slopes, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(host_volatility, device_volatility, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
-    CHECK_CUDA(cudaMemcpy(host_dri_values, device_dri_values, num_cities * sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(d_counts, h_counts, num_cities*sizeof(int), cudaMemcpyHostToDevice));
+    if(max_records>0)
+        CHECK_CUDA(cudaMemcpy(d_hum, flattened_data, flatN*sizeof(float), cudaMemcpyHostToDevice));
 
-    // Update cities data
-    for (int i = 0; i < num_cities; i++) {
-        cities[i].avg_humidity = host_avg_humidity[i];
-        cities[i].dry_days = host_dry_days[i];
-        cities[i].trend_slope = host_trend_slopes[i];
-        cities[i].dri_value = host_dri_values[i];
+    // clear accumulators
+    CHECK_CUDA(cudaMemset(d_sum,    0, num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMemset(d_abs,    0, num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMemset(d_first,  0, num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMemset(d_second, 0, num_cities*sizeof(double)));
+    CHECK_CUDA(cudaMemset(d_dry,    0, num_cities*sizeof(long long)));
+
+    // -------- Phase 1: accumulate --------
+    int threads = 256;
+    int kBlocksPerCity = 8;                // ปรับเป็น 4/8/16 แล้ววัด
+    int blocks = (num_cities>0) ? (num_cities * kBlocksPerCity) : 0;
+
+    if (max_records>0 && blocks>0) {
+        accumulate_city_stats<<<blocks, threads>>>(
+            d_hum, d_counts, d_sum, d_abs, d_first, d_second, d_dry,
+            max_records, num_cities, kBlocksPerCity
+        );
+        CHECK_CUDA(cudaGetLastError());
+        CHECK_CUDA(cudaDeviceSynchronize());
     }
 
-    // Sort cities by DRI using CPU
+    // -------- Phase 2: finalize --------
+    int fThreads = 128;
+    int fBlocks  = (num_cities + fThreads - 1) / fThreads;
+    finalize_city_stats<<<fBlocks, fThreads>>>(
+        d_sum, d_abs, d_first, d_second, d_dry, d_counts,
+        d_avg, d_slope, d_vol, d_dri, num_cities
+    );
+    CHECK_CUDA(cudaGetLastError());
+    CHECK_CUDA(cudaDeviceSynchronize());
+
+    // -------- Copy back & update --------
+    double* h_avg   = (double*)malloc(num_cities*sizeof(double));
+    double* h_slope = (double*)malloc(num_cities*sizeof(double));
+    double* h_vol   = (double*)malloc(num_cities*sizeof(double));
+    double* h_dri   = (double*)malloc(num_cities*sizeof(double));
+    long long* h_dry= (long long*)malloc(num_cities*sizeof(long long));
+
+    CHECK_CUDA(cudaMemcpy(h_avg,   d_avg,   num_cities*sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_slope, d_slope, num_cities*sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_vol,   d_vol,   num_cities*sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_dri,   d_dri,   num_cities*sizeof(double), cudaMemcpyDeviceToHost));
+    CHECK_CUDA(cudaMemcpy(h_dry,   d_dry,   num_cities*sizeof(long long), cudaMemcpyDeviceToHost));
+
+    for(int i=0;i<num_cities;i++){
+        cities[i].avg_humidity = h_avg[i];
+        cities[i].dry_days     = h_dry[i];
+        cities[i].trend_slope  = h_slope[i];
+        cities[i].dri_value    = h_dri[i];
+    }
     qsort(cities, num_cities, sizeof(CityDroughtRisk), compareDRI);
 
-    // Free device memory
-    CHECK_CUDA(cudaFree(device_record_counts));
-    CHECK_CUDA(cudaFree(device_avg_humidity));
-    CHECK_CUDA(cudaFree(device_dry_days));
-    CHECK_CUDA(cudaFree(device_trend_slopes));
-    CHECK_CUDA(cudaFree(device_volatility));
-    CHECK_CUDA(cudaFree(device_dri_values));
-    CHECK_CUDA(cudaFree(device_humidity_data));
+    // -------- Free --------
+    CHECK_CUDA(cudaFree(d_counts));
+    if(d_hum) CHECK_CUDA(cudaFree(d_hum));
+    CHECK_CUDA(cudaFree(d_sum));
+    CHECK_CUDA(cudaFree(d_abs));
+    CHECK_CUDA(cudaFree(d_first));
+    CHECK_CUDA(cudaFree(d_second));
+    CHECK_CUDA(cudaFree(d_dry));
+    CHECK_CUDA(cudaFree(d_avg));
+    CHECK_CUDA(cudaFree(d_slope));
+    CHECK_CUDA(cudaFree(d_vol));
+    CHECK_CUDA(cudaFree(d_dri));
 
-    // Free host memory
-    for (int i = 0; i < total_columns; i++) {
-        free(humidity_data[i]);
-    }
-    free(humidity_data);
-    free(host_record_counts);
-    free(flattened_data);
-    free(host_avg_humidity);
-    free(host_dry_days);
-    free(host_trend_slopes);
-    free(host_volatility);
-    free(host_dri_values);
+    CHECK_CUDA(cudaFreeHost(flattened_data));
+    for(int i=0;i<num_cities;i++) free(city_data[i]);
+    free(city_data);
+    free(city_write);
+    free(h_counts);
+    free(h_avg); free(h_slope); free(h_vol); free(h_dri); free(h_dry);
 }
 
-// Print top 3 cities with highest drought risk
+// ---------- Print ----------
 void printTop3Cities(double process_time) {
-    printf("Dataset: %d records\n", total_records);
+    printf("Dataset (max valid per city): %d records\n", total_records);
     printf("Top 3 Drought Risk Cities:\n");
-
     for (int i = 0; i < 3 && i < num_cities; i++) {
         printf("%d. %s (DRI: %.3f)\n", i + 1, cities[i].city_name, cities[i].dri_value);
     }
-
     printf("Time: %.3f seconds\n", process_time);
 }
 
-// Main program
+// ---------- Main ----------
 int main(int argc, char* argv[]) {
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <humidity_data.csv>\n", argv[0]);
         return EXIT_FAILURE;
     }
 
-    clock_t start_time = clock();
+    clock_t start = clock();
 
     loadMultiCityData(argv[1]);
     processAllDataGPU(argv[1]);
 
-    clock_t end_time = clock();
-    double process_time = ((double)(end_time - start_time)) / CLOCKS_PER_SEC;
+    clock_t end = clock();
+    double t = (double)(end - start) / CLOCKS_PER_SEC;
 
-    printTop3Cities(process_time);
-
+    printTop3Cities(t);
     return EXIT_SUCCESS;
 }
